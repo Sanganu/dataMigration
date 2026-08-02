@@ -1,1 +1,3 @@
 supabaselocalconnection.env
+supabase/.branches/
+supabase/.temp/
