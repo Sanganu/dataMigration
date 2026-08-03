@@ -107,3 +107,5 @@ on conflict (email) do update set
     phone          = coalesce(excluded.phone, app.users.phone),
     loyalty_points = coalesce(excluded.loyalty_points, app.users.loyalty_points),
     deleted_at     = excluded.deleted_at;
+
+commit;
