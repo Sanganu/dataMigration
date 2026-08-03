@@ -1,3 +1,6 @@
+-- =========================================================
+-- Step 1: crosswalk — Team A
+-- =========================================================
 create temp table tmp_users as
 select
     case
@@ -15,6 +18,9 @@ from legacy_team_a.users lega;
 
 create unique index on tmp_users(email);
 
+-- =========================================================
+-- Step 2: crosswalk — Team B merges in via email conflict
+-- =========================================================
 insert into tmp_users (user_id, legacy_a_id, legacy_b_id, email)
 select
     case
@@ -32,6 +38,38 @@ from legacy_team_b.customers legb
 on conflict (email) do update set
     legacy_b_id = excluded.legacy_b_id;
 
+-- =========================================================
+-- Step 3: log rows that can't be resolved (no email)
+-- =========================================================
+-- Team A
+-- =========================================================
+insert into app.migration_exceptions (source_table, source_id, reason_code, reason_detail, raw_data)
+select
+    'legacy_team_a.users',
+    lca.id,
+    'MISSING_EMAIL',
+    'No email on source row — cannot resolve identity for merge',
+    to_jsonb(lca.*)
+from tmp_users tu
+join legacy_team_a.users lca on tu.legacy_a_id = lca.id
+where tu.email is null;
+-- =========================================================
+-- TeamB
+-- =========================================================
+insert into app.migration_exceptions (source_table, source_id, reason_code, reason_detail, raw_data)
+select
+    'legacy_team_b.customers',
+    lcb.id::text,
+    'MISSING_EMAIL',
+    'No email on source row — cannot resolve identity for merge',
+    to_jsonb(lcb.*)
+from tmp_users tu
+join legacy_team_b.customers lcb on tu.legacy_b_id = lcb.id
+where tu.email is null;
+
+-- =========================================================
+-- Step 4: the actual merge into app.users
+-- =========================================================
 insert into app.users (id, email, first_name, last_name, role, phone, loyalty_points, deleted_at)
 select
     tu.user_id,
@@ -69,8 +107,3 @@ on conflict (email) do update set
     phone          = coalesce(excluded.phone, app.users.phone),
     loyalty_points = coalesce(excluded.loyalty_points, app.users.loyalty_points),
     deleted_at     = excluded.deleted_at;
-
-commit;
-
-select * from app.users;
-
