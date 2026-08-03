@@ -32,4 +32,45 @@ from legacy_team_b.customers legb
 on conflict (email) do update set
     legacy_b_id = excluded.legacy_b_id;
 
-select * from users;
+insert into app.users (id, email, first_name, last_name, role, phone, loyalty_points, deleted_at)
+select
+    tu.user_id,
+    tu.email,
+    coalesce(split_part(lca.full_name, ' ', 1), lcb.first_name),
+    coalesce(trim(substring(lca.full_name from position(' ' in lca.full_name))), lcb.last_name),
+    coalesce(
+        case
+            when upper(trim(lca.role)) = 'A' then 'ADMIN'
+            when upper(trim(lca.role)) = 'S' then 'STAFF'
+            when upper(trim(lca.role)) = 'C' then 'CUSTOMER'
+        end,
+        case
+            when lower(trim(lcb.account_type)) = 'standard' then 'CUSTOMER'
+            when lower(trim(lcb.account_type)) = 'premium' then 'ADMIN'
+            when lower(trim(lcb.account_type)) = 'staff' then 'STAFF'
+        end,
+        'CUSTOMER'
+    )::app.user_role,
+    lca.phone,
+    lcb.loyalty_points,
+    case
+        when lca.deleted_at is not null then lca.deleted_at
+        when lcb.is_active = false then now()
+        else null
+    end
+from tmp_users tu
+left join legacy_team_a.users lca on tu.legacy_a_id = lca.id
+left join legacy_team_b.customers lcb on tu.legacy_b_id = lcb.id
+where tu.email is not null
+on conflict (email) do update set
+    first_name     = excluded.first_name,
+    last_name      = excluded.last_name,
+    role           = excluded.role,
+    phone          = coalesce(excluded.phone, app.users.phone),
+    loyalty_points = coalesce(excluded.loyalty_points, app.users.loyalty_points),
+    deleted_at     = excluded.deleted_at;
+
+commit;
+
+select * from app.users;
+
