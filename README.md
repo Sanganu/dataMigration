@@ -1,193 +1,133 @@
-### Evaluation summary
-- **What it is:** A Supabase (Postgres) demo that reconciles two legacy user datasets (Team A + Team B) into a unified target schema `app.users`, with an exception-logging pattern for unresolvable rows.
-- **Structure:** Clean, numbered migrations under `supabase/migrations/` (001–007) + `config.toml` + ad-hoc validation snippets. Solid separation of legacy schemas, target schema, seed, exceptions, and merge logic.
-- **Strengths:** Clear naming, comments in SQL explain intent, realistic messy data (bad emails, garbage role codes, soft-delete conflicts, overlapping identities), set-based merge with `ON CONFLICT`, exceptions table instead of silently dropping rows.
-- **Gaps / suggestions:**
-  
-  - `snippets/Untitled query 481.sql` etc. should be renamed to something descriptive (e.g., `validate_merge.sql`).
-  - Consider a `rollback.sql` / idempotency notes.
-  - Role mapping in `006_merge_users.sql` maps Team B `'premium' → ADMIN` — this looks like a bug (premium customers are usually `CUSTOMER`, not admins). Worth calling out.
-  - Deleted-state reconciliation currently prefers Team A's `deleted_at`; document the precedence rule.
-  - No tests / assertions beyond two select statements in `007_validating_sqlqueries.sql`.
-
----
-
-
-
-````markdown
 # dataMigration
 
-A Supabase / PostgreSQL reference project that demonstrates how to **merge two legacy user datasets with conflicting schemas into a single, reconciled target schema** — safely, idempotently, and with full exception tracking.
+Small demo showing how I'd merge two legacy user tables with different
+schemas into one target table, without silently losing rows I can't
+resolve.
 
-The project simulates a realistic post-acquisition or post-reorg scenario where **Team A** and **Team B** each ran their own user store with different conventions, and the business now needs one canonical `app.users` table.
+The scenario: Team A and Team B each had their own `users` table before
+a merger. Team A used mixed int/uuid ids stored as text, a single
+`full_name` field, and single-letter role codes. Team B used real
+UUIDs, split first/last names, and a different role vocabulary. Neither
+side maps cleanly onto the other, so the target schema (`app.users`)
+has to reconcile both.
 
----
+This is a demo, not the actual client project — smaller, one entity
+(users), built to show the pattern rather than a full migration.
 
-## Table of contents
-- [Scenario](#scenario)
-- [Architecture](#architecture)
-- [Repository layout](#repository-layout)
-- [Migration pipeline](#migration-pipeline)
-- [Prerequisites](#prerequisites)
-- [Getting started](#getting-started)
-- [Validating the merge](#validating-the-merge)
-- [Design decisions](#design-decisions)
-- [Known issues / TODO](#known-issues--todo)
-- [License](#license)
+## Schema differences
 
----
+| | Team A (`legacy_team_a.users`) | Team B (`legacy_team_b.customers`) | Target (`app.users`) |
+|---|---|---|---|
+| id | text, mixed int / real uuid | uuid | uuid |
+| name | single `full_name` | `first_name` + `last_name` | `first_name` + `last_name` |
+| role | `'A'` / `'C'` / `'S'`, occasionally garbage | `'standard'` / `'premium'` / `'staff'` | enum: `ADMIN` / `CUSTOMER` / `STAFF` |
+| soft delete | `deleted_at` | `is_active` (boolean) | `deleted_at` |
+| extra | `phone` | `loyalty_points` | both |
 
-## Scenario
-
-| Source | Schema | Key style | Name field | Role vocab | Soft-delete signal | Extra |
-|---|---|---|---|---|---|---|
-| `legacy_team_a.users` | Legacy A | `text` (mixed int / uuid) | single `full_name` | `A` / `C` / `S` (+ garbage) | `deleted_at` | `phone` |
-| `legacy_team_b.customers` | Legacy B | `uuid` | `first_name` + `last_name` | `standard` / `premium` / `staff` | `is_active = false` | `loyalty_points` |
-| `app.users` | **Target** | `uuid` | `first_name` + `last_name` | enum `ADMIN` / `CUSTOMER` / `STAFF` | `deleted_at` | both `phone` and `loyalty_points` |
-
-The seed data intentionally includes:
-- Users that exist in **both** sources (true merge cases, e.g. `grace@example.edu`, `katherine@example.edu`).
-- Users with **missing or malformed emails** (unresolvable → logged as exceptions).
-- Users with **garbage role codes** (`'X'`) that must fall back to a safe default.
-- A **pre-migrated row** in `app.users` (idempotency test — the pipeline must not duplicate `ada@example.edu`).
-- Conflicting soft-delete signals between Team A (`deleted_at`) and Team B (`is_active`).
-
----
-
-## Architecture
+## Files
 
 ```
-┌──────────────────────┐        ┌──────────────────────┐
-│ legacy_team_a.users  │        │ legacy_team_b.customers │
-│  (text ids, messy)   │        │  (uuid ids, split name) │
-└──────────┬───────────┘        └───────────┬──────────┘
-           │                                │
-           │   normalize + crosswalk        │
-           ▼                                ▼
-        ┌───────────────── tmp_users ─────────────────┐
-        │  unique per lower(trim(email))              │
-        │  carries legacy_a_id + legacy_b_id          │
-        └──────────────────────┬──────────────────────┘
-                               │
-             ┌─────────────────┴─────────────────┐
-             │                                   │
-             ▼                                   ▼
-   ┌──────────────────┐              ┌────────────────────────────┐
-   │   app.users      │              │ app.migration_exceptions   │
-   │ (canonical)      │              │ (MISSING_EMAIL, etc.)      │
-   └──────────────────┘              └────────────────────────────┘
+supabase/migrations/
+  001_legacy_teamA_schema_users.sql     source A
+  002_legacy_teamB_schema_users.sql     source B
+  003_target_schema_users.sql           app.users
+  004_seed_users.sql                    messy seed data, both sources
+  005_migrations_exceptions_schema.sql  exception log table
+  006_merge_users.sql                   the actual merge
+  007_validating_sqlqueries.sql         post-merge checks
 ```
 
----
+## How the merge works (`006_merge_users.sql`)
 
-## Repository layout
+1. Build a temp table `tmp_users` from Team A. If the id already looks
+   like a UUID (regex check), keep it; otherwise generate a new one.
+   Email gets `lower(trim(...))`'d. Unique index on email.
+2. Insert Team B into the same temp table. If the email already
+   exists (same person migrated from Team A), attach `legacy_b_id` to
+   that row instead of creating a second one — this is the actual
+   merge point.
+3. Any row from either source with no usable email goes into
+   `app.migration_exceptions` with a reason code and the raw row as
+   jsonb. It doesn't get silently dropped, but it also doesn't block
+   the rest of the migration.
+4. `INSERT ... ON CONFLICT (email) DO UPDATE` into `app.users`. Name
+   prefers Team A's `full_name` split on the first space, falls back
+   to Team B. Role: Team A's letter code first, then Team B's
+   `account_type`, then default to `CUSTOMER`. Phone and loyalty
+   points each only exist on one side, so updates use `COALESCE` to
+   avoid overwriting a real value with null.
 
-```
-.
-├── README.md
-├── .gitignore
-└── supabase/
-    ├── config.toml                 # Local Supabase CLI configuration
-    ├── migrations/
-    │   ├── 001_legacy_teamA_schema_users.sql       # source A schema
-    │   ├── 002_legacy_teamB_schema_users.sql       # source B schema
-    │   ├── 003_target_schema_users.sql             # canonical app.users
-    │   ├── 004_seed_users.sql                      # realistic messy seed data
-    │   ├── 005_migrations_exceptions_schema.sql    # exception log table
-    │   ├── 006_merge_users.sql                     # the actual merge pipeline
-    │   └── 007_validating_sqlqueries.sql           # post-merge sanity checks
-    └── snippets/                    # ad-hoc SQL used during development
-```
+Re-running `006` against a database that already has matching
+`app.users` rows updates them instead of duplicating — that's what the
+pre-inserted Ada Lovelace row in the seed data is there to check.
 
----
-
-## Migration pipeline
-
-The merge logic in `006_merge_users.sql` runs in four deterministic steps:
-
-1. **Crosswalk from Team A** — Build a temporary `tmp_users` table. Preserve Team A's UUIDs when the id already looks like a UUID; otherwise mint a fresh one. Normalize email to `lower(trim(...))`. Enforce a unique index on `email`.
-2. **Crosswalk from Team B** — Insert Team B rows into the same `tmp_users`. On email conflict, attach `legacy_b_id` to the existing row (this is where a "same person, two sources" record is recognized as a single identity).
-3. **Log unresolvable rows** — Any row from either source with a null / empty email is inserted into `app.migration_exceptions` with `reason_code = 'MISSING_EMAIL'` and the raw source row stored as `jsonb`. Nothing is silently dropped.
-4. **Merge into `app.users`** — Set-based `INSERT ... ON CONFLICT (email) DO UPDATE`:
-   - **Name:** prefer Team A's `full_name` split on the first space; fall back to Team B's `first_name` / `last_name`.
-   - **Role:** map Team A's single-letter code → enum; else map Team B's `account_type` → enum; else default to `CUSTOMER`.
-   - **Phone:** only Team A has it; carried through, but never overwritten with `NULL` on update.
-   - **Loyalty points:** only Team B has it; same non-null-preserving rule.
-   - **`deleted_at`:** Team A's `deleted_at` wins; if it's null but Team B says `is_active = false`, stamp `now()`.
-
-The pipeline is **idempotent**: re-running the merge against an `app.users` that already contains matching rows updates them in place rather than duplicating.
-
----
-
-## Prerequisites
-
-- [Docker](https://www.docker.com/) (required by Supabase local dev)
-- [Supabase CLI](https://supabase.com/docs/guides/local-development/cli/getting-started) `>= 1.x`
-- PostgreSQL client (`psql`) for running validation queries (optional)
-
----
-
-## Getting started
+## Running it
 
 ```bash
-# 1. Clone
 git clone https://github.com/Sanganu/dataMigration.git
 cd dataMigration
-
-# 2. Start a local Supabase stack (Postgres 17, Studio on :54323, API on :54321)
 supabase start
-
-# 3. Apply all migrations in order (001 → 007)
-supabase db reset
+supabase db reset   # runs 001-007 in order
 ```
 
-`supabase db reset` will:
-1. Drop and recreate the local database.
-2. Run every file in `supabase/migrations/` in filename order.
-3. Leave you with:
-   - `legacy_team_a.users` and `legacy_team_b.customers` populated with seed data
-   - `app.users` populated with the merged, reconciled result
-   - `app.migration_exceptions` populated with any rows that could not be merged
+Then check `app.users` and `app.migration_exceptions` in Studio
+(`http://127.0.0.1:54323`), or run the two queries in
+`007_validating_sqlqueries.sql` directly.
 
-Open Supabase Studio at [http://127.0.0.1:54323](http://127.0.0.1:54323) to browse the resulting tables.
+## Known gaps
 
----
+I traced the merge against the seed data by hand rather than just
+running it, and found a few things worth being upfront about instead
+of pretending this is finished:
 
-## Validating the merge
+- **Garbage role codes don't get logged.** The seed data has a row
+  with role `'X'`, which isn't `A`/`C`/`S`. It falls through both
+  `CASE` branches and lands on the hardcoded `CUSTOMER` default —
+  silently. `005`'s own comment says bad values get logged with a
+  reason, but that's only true for missing emails. Role garbage just
+  gets defaulted. I haven't decided yet if that's the right behavior
+  or if it should also go to `migration_exceptions`.
 
-Run the queries in `007_validating_sqlqueries.sql`:
+- **`'premium'` maps to `ADMIN`.** In step 4, Team B's `account_type =
+  'premium'` maps to the `ADMIN` role. That reads wrong — a paying
+  customer tier becoming an administrative role — and I'm not sure
+  yet if that's a leftover placeholder or if Team B's system actually
+  conflated the two. Flagging it here instead of hiding it.
 
-```sql
--- Final merged users
-select * from app.users order by email;
+- **`007` isn't real validation, it's two queries.** It shows you the
+  final table and an exception count, but it can't tell you whether
+  every source row is actually accounted for. What it should have:
+  `count(legacy_team_a) + count(legacy_team_b) - known_email_overlaps
+  = count(app.users) + count(migration_exceptions)`. That reconciliation
+  check doesn't exist yet.
 
--- Exception summary by reason code
-select reason_code, count(*)
-from app.migration_exceptions
-group by reason_code;
-```
+- **No constraint on phone format.** The seed data has a row with
+  phone `'not-a-phone'` on purpose, and it just gets copied through —
+  `app.users.phone` is plain `text` with no check.
 
-Expected observations after a clean run:
-- Ada Lovelace appears **once** even though she was pre-inserted in `app.users` and also existed in Team A (idempotency).
-- Grace Hopper and Katherine Johnson each appear **once**, combining Team A's phone with Team B's loyalty points.
-- Margaret Hamilton appears from Team B only.
-- Edith Clarke (Team A, no email) shows up in `app.migration_exceptions` with `MISSING_EMAIL`, **not** in `app.users`.
+- **Name splitting is naive.** `full_name` is split on the first
+  space, so a name like "Ada K. Lovelace" would put "K." into
+  `last_name`. Fine for this seed data, not fine for real names.
 
----
+- **Idempotency depends on `ON CONFLICT`, not on the temp table.**
+  `tmp_users.user_id` for a row that's already in `app.users` (the
+  pre-inserted Ada row) won't match the real `app.users.id` unless the
+  legacy id happens to be the same UUID. The `ON CONFLICT ... DO
+  UPDATE` clause doesn't touch `id`, so it works in this demo — but if
+  a second table referencing `app.users.id` gets added later, it would
+  need to look up the real id from `app.users` rather than trusting
+  `tmp_users.user_id`.
 
-## Design decisions
+None of these are hidden or fixed in a later migration — this is the
+state of the code as it stands, and I'd rather the README say so than
+have it look more finished than it is.
 
-- **Set-based over row-by-row.** The pipeline uses a single `INSERT ... ON CONFLICT` rather than a PL/pgSQL cursor loop. This is intentional: Postgres is optimized for set-based work, and it composes cleanly with the exceptions table for anything that can't be handled declaratively. A cursor-based variant would be appropriate only if per-row business rules were required.
-- **Email as the merge key.** Legacy ids are incompatible between sources, so the reconciled identity is anchored on `lower(trim(email))`. Rows without an email cannot be merged and are diverted to exceptions.
-- **Exceptions, not silent drops.** Every unresolvable row is logged with `source_table`, `source_id`, `reason_code`, and the raw row as `jsonb` — auditable and re-processable.
-- **Precedence rules.** Team A wins for `phone` and `deleted_at`; Team B wins for `loyalty_points`. Names prefer Team A only because Team A carries the "richer" free-form field. This is documented so future contributors can change it deliberately.
+## Why set-based instead of a cursor loop
 
-
-
-## Known issues / TODO
-
-
-- [ ] Split of `full_name` uses a naïve first-space split — names like `"Ada K. Lovelace"` land the middle initial into `last_name`.
-- [ ] Rename files in `supabase/snippets/` from `Untitled query NNN.sql` to descriptive names.
-- [ ] Add a `rollback.sql` that truncates `app.users` and `app.migration_exceptions` for repeatable local testing without a full `db reset`.
-- [ ] Add automated assertion tests (e.g. `pgTAP`) covering: idempotency, exception logging, role mapping, deleted-state reconciliation.
+Team A's data is small and doesn't have interdependent business logic
+between rows, so a single `INSERT ... ON CONFLICT` does the whole
+merge without row-by-row processing. That's a genuinely different
+situation from cases where you need per-row sequencing (e.g. an
+insert-only, append-on-change source table, which is a different
+project not shown here) — that kind of source needs a cursor, this
+one doesn't.
